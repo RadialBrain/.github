@@ -1,0 +1,250 @@
+name: Cloudflare preview
+
+# Reusable workflow for Cloudflare Worker previews on pull requests.
+#
+# Callers must trigger it from `pull_request_target`, so the steps that see
+# CLOUDFLARE_API_TOKEN come from the default branch, never from the PR.
+# The PR's code is untrusted:
+#   - it is installed and bundled with no secrets in the environment;
+#   - the Wrangler config comes from the base branch, so a PR cannot change the
+#     Worker name, account, assets directory, or build command;
+#   - symlinks are refused and local env/config files are removed before the
+#     upload step, the only step that sees the token.
+#
+# Uploads a Worker Version with a `pr-<N>` preview alias. Nothing is deployed.
+# Comments the URL on the PR and on each issue the PR closes.
+
+on:
+  workflow_call:
+    inputs:
+      working-directory:
+        description: Directory holding the Worker's Wrangler config
+        type: string
+        default: worker
+      paths:
+        description: Newline-separated paths that trigger this preview. `dir/**` matches a prefix; anything else matches exactly.
+        type: string
+        required: true
+      environment:
+        description: GitHub environment name (`preview` or `preview-<worker>`)
+        type: string
+        default: preview
+      wrangler-env:
+        description: Wrangler `--env` to preview (empty for the top-level Worker)
+        type: string
+        default: ""
+      link-path:
+        description: Path appended to the preview URL in comments, e.g. `/scan`
+        type: string
+        default: ""
+      title:
+        description: Comment heading
+        type: string
+        default: Cloudflare preview
+      note:
+        description: One paragraph shown under the PR comment
+        type: string
+        default: ""
+      node-version:
+        type: string
+        default: "22"
+      wrangler-version:
+        description: Wrangler used for bundle and upload (>= 4.21 for preview aliases)
+        type: string
+        default: "4.131.1"
+    secrets:
+      CLOUDFLARE_API_TOKEN:
+        required: true
+
+jobs:
+  changes:
+    # Fork PRs never get the token.
+    if: github.event_name == 'pull_request_target' && github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    outputs:
+      changed: ${{ steps.match.outputs.changed }}
+    steps:
+      - id: match
+        uses: actions/github-script@v7
+        env:
+          PATHS: ${{ inputs.paths }}
+        with:
+          script: |
+            const patterns = process.env.PATHS.split('\n').map((p) => p.trim()).filter(Boolean);
+            const matches = (file) =>
+              patterns.some((p) => (p.endsWith('/**') ? file.startsWith(p.slice(0, -2)) : file === p));
+            const files = await github.paginate(github.rest.pulls.listFiles, {
+              ...context.repo,
+              pull_number: context.payload.pull_request.number,
+              per_page: 100,
+            });
+            const changed = files.some((f) => matches(f.filename) || (f.previous_filename && matches(f.previous_filename)));
+            core.setOutput('changed', String(changed));
+
+  preview:
+    needs: changes
+    if: needs.changes.outputs.changed == 'true'
+    runs-on: ubuntu-latest
+    environment:
+      name: ${{ inputs.environment }}
+      url: ${{ steps.upload.outputs.url }}
+    env:
+      PR_NUMBER: ${{ github.event.pull_request.number }}
+      HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+      DIR: ${{ inputs.working-directory }}
+      WRANGLER_ENV: ${{ inputs.wrangler-env }}
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+
+      # Installed before the PR is checked out, so no PR file can influence it.
+      - name: Install Wrangler
+        env:
+          WRANGLER_VERSION: ${{ inputs.wrangler-version }}
+        run: |
+          cd "$RUNNER_TEMP"
+          npm install --prefix "$RUNNER_TEMP/wrangler" --no-save --ignore-scripts --no-audit --no-fund "wrangler@${WRANGLER_VERSION}"
+          echo "WRANGLER=$RUNNER_TEMP/wrangler/node_modules/.bin/wrangler" >> "$GITHUB_ENV"
+
+      - uses: actions/checkout@v4
+        with:
+          ref: refs/pull/${{ github.event.pull_request.number }}/merge
+          path: pr
+          fetch-depth: 2
+          persist-credentials: false
+
+      - name: Use the base branch Wrangler config
+        working-directory: pr
+        run: |
+          set -euo pipefail
+          base=$(git rev-parse HEAD^1)
+          cfg=""
+          for name in wrangler.json wrangler.jsonc wrangler.toml; do
+            if git cat-file -e "${base}:${DIR}/${name}" 2>/dev/null; then cfg="$name"; break; fi
+          done
+          if [ -z "$cfg" ]; then
+            echo "::error::No Wrangler config in ${DIR}/ on the base branch"
+            exit 1
+          fi
+          rm -f "${DIR}/wrangler.json" "${DIR}/wrangler.jsonc" "${DIR}/wrangler.toml"
+          git show "${base}:${DIR}/${cfg}" > "${DIR}/${cfg}"
+          echo "WRANGLER_CONFIG=${cfg}" >> "$GITHUB_ENV"
+
+      - name: Refuse symlinks and remove local env files
+        working-directory: pr
+        run: |
+          set -euo pipefail
+          links=$(git ls-files -s | awk '$1 == "120000" { print $4 }')
+          if [ -n "$links" ]; then
+            echo "::error::Symlinks are not allowed in preview builds:"
+            echo "$links"
+            exit 1
+          fi
+          find . -path ./.git -prune -o \( \
+            -name '.env' -o -name '.env.*' -o -name '.dev.vars' -o -name '.dev.vars.*' \
+            -o -name '.npmrc' -o -name '.yarnrc' -o -name '.yarnrc.yml' \
+          \) -type f -print -exec rm -f {} +
+          find . -path ./.git -prune -o -type d -name .wrangler -prune -print -exec rm -rf {} +
+
+      - name: Install dependencies (no scripts, no secrets)
+        working-directory: pr/${{ inputs.working-directory }}
+        run: npm ci --ignore-scripts --no-audit --no-fund
+
+      - name: Bundle (no secrets)
+        working-directory: pr/${{ inputs.working-directory }}
+        run: |
+          set -euo pipefail
+          args=(versions upload --config "$WRANGLER_CONFIG" --dry-run --outdir "$RUNNER_TEMP/bundle")
+          if [ -n "$WRANGLER_ENV" ]; then args+=(--env "$WRANGLER_ENV"); fi
+          "$WRANGLER" "${args[@]}"
+          mapfile -t entries < <(find "$RUNNER_TEMP/bundle" -maxdepth 1 -type f -name '*.js')
+          if [ "${#entries[@]}" -ne 1 ]; then
+            echo "::error::Expected one bundled entry file, found ${#entries[@]}"
+            exit 1
+          fi
+          echo "BUNDLE_ENTRY=${entries[0]}" >> "$GITHUB_ENV"
+
+      # The only step with the token. It uploads the prebuilt bundle; Wrangler
+      # does not bundle or run PR code here.
+      - name: Upload preview version
+        id: upload
+        working-directory: pr/${{ inputs.working-directory }}
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_API_BASE_URL: https://api.cloudflare.com/client/v4
+          LINK_PATH: ${{ inputs.link-path }}
+        run: |
+          set -euo pipefail
+          case "$PR_NUMBER" in
+            ''|*[!0-9]*) echo "::error::Unexpected pull request number"; exit 1 ;;
+          esac
+          args=(versions upload --config "$WRANGLER_CONFIG" --no-bundle --script "$BUNDLE_ENTRY"
+                --preview-alias "pr-${PR_NUMBER}" --message "PR #${PR_NUMBER} ${HEAD_SHA:0:7}")
+          if [ -n "$WRANGLER_ENV" ]; then args+=(--env "$WRANGLER_ENV"); fi
+          "$WRANGLER" "${args[@]}" 2>&1 | tee "$RUNNER_TEMP/upload.log"
+
+          alias_url=$(grep -oE "https://pr-${PR_NUMBER}-[a-z0-9.-]+\.workers\.dev" "$RUNNER_TEMP/upload.log" | head -1 || true)
+          version_url=$(sed -n 's/.*Version Preview URL: *\(https:[^ ]*\).*/\1/p' "$RUNNER_TEMP/upload.log" | head -1 || true)
+          if [ -z "$alias_url" ]; then
+            echo "::error::No preview alias URL in wrangler output"
+            exit 1
+          fi
+          echo "url=${alias_url}${LINK_PATH}" >> "$GITHUB_OUTPUT"
+          if [ -n "$version_url" ]; then
+            echo "version_url=${version_url}${LINK_PATH}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Comment on the PR and the issues it closes
+        uses: actions/github-script@v7
+        env:
+          URL: ${{ steps.upload.outputs.url }}
+          VERSION_URL: ${{ steps.upload.outputs.version_url }}
+          ENVIRONMENT: ${{ inputs.environment }}
+          TITLE: ${{ inputs.title }}
+          NOTE: ${{ inputs.note }}
+        with:
+          script: |
+            const { URL, VERSION_URL, ENVIRONMENT, TITLE, NOTE, HEAD_SHA } = process.env;
+            const { owner, repo } = context.repo;
+            const prNumber = context.payload.pull_request.number;
+            const sha = HEAD_SHA.slice(0, 7);
+            const env = ENVIRONMENT.toLowerCase();
+            const marker = `<!-- rb-preview:${env} -->`;
+            // Comments written before this workflow existed.
+            const legacy = `<!-- cf-worker-preview${env.replace(/^preview-?/, (m) => (m === 'preview-' ? ':' : ''))} -->`;
+
+            async function upsert(issue_number, body, markers) {
+              const comments = await github.paginate(github.rest.issues.listComments, { owner, repo, issue_number, per_page: 100 });
+              const existing = comments.find((c) => c.body && markers.some((m) => c.body.includes(m)));
+              if (!existing) {
+                await github.rest.issues.createComment({ owner, repo, issue_number, body });
+              } else if (existing.body !== body) {
+                await github.rest.issues.updateComment({ owner, repo, comment_id: existing.id, body });
+              }
+            }
+
+            const prLines = [marker, `### ${TITLE}`, '', '| | |', '|--|--|', `| **Preview (this PR)** | ${URL} |`];
+            if (VERSION_URL) prLines.push(`| This commit | ${VERSION_URL} |`);
+            prLines.push(`| Commit | \`${sha}\` |`);
+            if (NOTE) prLines.push('', NOTE);
+            await upsert(prNumber, prLines.join('\n'), [marker, legacy]);
+
+            const data = await github.graphql(
+              `query($owner: String!, $repo: String!, $number: Int!) {
+                repository(owner: $owner, name: $repo) {
+                  pullRequest(number: $number) {
+                    closingIssuesReferences(first: 20) { nodes { number repository { nameWithOwner } } }
+                  }
+                }
+              }`,
+              { owner, repo, number: prNumber },
+            );
+            const issues = (data.repository.pullRequest?.closingIssuesReferences.nodes ?? [])
+              .filter((n) => n.repository.nameWithOwner.toLowerCase() === `${owner}/${repo}`.toLowerCase())
+              .map((n) => n.number);
+            const issueBody = [marker, `### ${TITLE}`, '', `**${URL}**`, '', `From #${prNumber} at \`${sha}\`. Updates on every push to the PR.`].join('\n');
+            for (const number of issues) {
+              await upsert(number, issueBody, [marker]);
+            }
+            core.info(`Commented on PR #${prNumber} and issues: ${issues.join(', ') || 'none'}`);
